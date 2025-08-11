@@ -1,0 +1,119 @@
+CREATE PROCEDURE dbo.usp_ShrinkDBFile_ProdSafe
+(
+    @DbName SYSNAME,
+    @FileName SYSNAME,
+    @FreeSpacePercentThreshold INT = 20,
+    @AllowedStart TIME = '01:00',
+    @AllowedEnd TIME = '04:00',
+    @DryRun BIT = 0
+)
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    DECLARE @TargetFreeMB INT;
+    DECLARE @ShrinkIncrementMB INT = 150;
+    DECLARE @SizeMB INT;
+    DECLARE @UsedMB INT;
+    DECLARE @FreeMB INT;
+    DECLARE @FreePercent DECIMAL(5,2);
+    DECLARE @Sql NVARCHAR(2000);
+    DECLARE @Status NVARCHAR(500);
+    DECLARE @CurrentTime TIME;
+
+    BEGIN TRY
+        -- Check time window
+        SET @CurrentTime = CONVERT(TIME, GETDATE());
+        IF NOT (
+            (@AllowedStart < @AllowedEnd AND @CurrentTime BETWEEN @AllowedStart AND @AllowedEnd)
+            OR
+            (@AllowedStart > @AllowedEnd AND (@CurrentTime >= @AllowedStart OR @CurrentTime <= @AllowedEnd))
+        )
+        BEGIN
+            PRINT 'Current time outside allowed window. Exiting.';
+            RETURN;
+        END
+
+        -- Switch to target DB
+        SET @Sql = 'USE [' + QUOTENAME(@DbName) + '];';
+        EXEC (@Sql);
+
+        -- Get current size and usage
+        SELECT 
+            @SizeMB = size / 128, 
+            @UsedMB = FILEPROPERTY(name, 'SpaceUsed') / 128
+        FROM sysfiles
+        WHERE name = @FileName;
+
+        SET @FreeMB = @SizeMB - @UsedMB;
+        SET @FreePercent = (CAST(@FreeMB AS DECIMAL(10,2)) / @SizeMB) * 100;
+
+        IF @FreePercent <= @FreeSpacePercentThreshold
+        BEGIN
+            PRINT 'Skip shrink: Free space (' + CAST(@FreePercent AS VARCHAR(10)) + '%) below threshold (' + CAST(@FreeSpacePercentThreshold AS VARCHAR(10)) + '%)';
+            RETURN;
+        END
+
+        -- Decide target free space buffer
+        IF @UsedMB BETWEEN 0 AND 1024
+            SET @TargetFreeMB = 32;
+        ELSE IF @UsedMB BETWEEN 1025 AND 5000
+            SET @TargetFreeMB = 96;
+        ELSE IF @UsedMB BETWEEN 5001 AND 10000
+            SET @TargetFreeMB = 192;
+        ELSE 
+            SET @TargetFreeMB = 384;
+
+        RAISERROR('Shrink procedure started on DB [%s], file [%s]', 0, 1, @DbName, @FileName) WITH NOWAIT;
+        SELECT StartFileSizeMB = @SizeMB, StartUsedSpaceMB = @UsedMB, StartFreePercent = @FreePercent;
+
+        -- Dry run mode: just print info and exit
+        IF @DryRun = 1
+        BEGIN
+            PRINT 'Dry run enabled - no shrink will be performed.';
+            RETURN;
+        END
+
+        -- Shrink loop
+        WHILE @SizeMB > @UsedMB + @TargetFreeMB + @ShrinkIncrementMB
+        BEGIN
+            -- Wait for no blocking sessions
+            WHILE EXISTS (
+                SELECT 1
+                FROM sys.dm_exec_requests r
+                JOIN sys.dm_exec_sessions s ON r.session_id = s.session_id
+                WHERE r.blocking_session_id <> 0
+                  AND s.is_user_process = 1
+            )
+            BEGIN
+                RAISERROR('Blocking detected... waiting 30 seconds...', 0, 1) WITH NOWAIT;
+                WAITFOR DELAY '00:00:30';
+            END
+
+            SET @Sql = 'DBCC SHRINKFILE ([' + @FileName + '], ' + CONVERT(VARCHAR(20), @SizeMB - @ShrinkIncrementMB) + ') WITH NO_INFOMSGS';
+
+            RAISERROR('Starting shrink step: %s', 0, 1, @Sql) WITH NOWAIT;
+            EXEC(@Sql);
+            RAISERROR('Shrink step completed.', 0, 1) WITH NOWAIT;
+
+            -- Refresh size info
+            SELECT 
+                @SizeMB = size / 128, 
+                @UsedMB = FILEPROPERTY(@FileName, 'SpaceUsed') / 128
+            FROM sysfiles
+            WHERE name = @FileName;
+        END
+
+        SET @FreeMB = @SizeMB - @UsedMB;
+        SET @FreePercent = (CAST(@FreeMB AS DECIMAL(10,2)) / @SizeMB) * 100;
+
+        RAISERROR('Shrink procedure completed successfully.', 0, 1) WITH NOWAIT;
+        SELECT EndFileSizeMB = @SizeMB, EndUsedSpaceMB = @UsedMB, EndFreePercent = @FreePercent;
+    END TRY
+    BEGIN CATCH
+        DECLARE @ErrMsg NVARCHAR(4000) = ERROR_MESSAGE();
+        DECLARE @ErrSeverity INT = ERROR_SEVERITY();
+        RAISERROR('ERROR in shrink procedure: %s', @ErrSeverity, 1, @ErrMsg) WITH NOWAIT;
+    END CATCH
+END
+GO

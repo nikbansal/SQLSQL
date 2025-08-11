@@ -1,0 +1,7 @@
+EXEC dbo.usp_ShrinkDBFile_ProdSafe
+    @DbName = 'YourDatabaseName',
+    @FileName = 'YourLogicalFileName',
+    @FreeSpacePercentThreshold = 20,
+    @AllowedStart = '01:00',
+    @AllowedEnd = '04:00',
+    @DryRun = 0;  -- 1 = just simulate, no shrink
