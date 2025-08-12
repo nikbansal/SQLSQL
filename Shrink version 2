@@ -1,0 +1,122 @@
+USE [master];
+GO
+
+IF OBJECT_ID('dbo.ShrinkDbFileSafely', 'P') IS NOT NULL
+    DROP PROCEDURE dbo.ShrinkDbFileSafely;
+GO
+
+CREATE PROCEDURE dbo.ShrinkDbFileSafely
+    @DatabaseName SYSNAME,         -- Database to shrink
+    @FileName SYSNAME,             -- Logical file name to shrink
+    @ShrinkIncrementMB INT = 5000, -- Amount to shrink per loop (default 5 GB)
+    @MaxMinutes INT = 60,           -- Max duration in minutes
+    @DryRun BIT = 0                -- 1 = dry run (no actual shrink), 0 = execute shrink
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    DECLARE @StartTime DATETIME = GETDATE();
+    DECLARE @SQL NVARCHAR(MAX);
+    DECLARE @CurrentSizeMB INT;
+    DECLARE @TargetSizeMB INT;
+    DECLARE @Msg NVARCHAR(4000);
+
+    -- For blocking check
+    DECLARE @Blocking INT;
+    DECLARE @RetryCount INT;
+    DECLARE @MaxRetries INT = 10;
+
+    SET @Msg = '--- Shrink Operation Started at ' + CONVERT(VARCHAR, @StartTime, 120) + ' ---';
+    RAISERROR(@Msg, 0, 1) WITH NOWAIT;
+
+    WHILE DATEDIFF(MINUTE, @StartTime, GETDATE()) < @MaxMinutes
+    BEGIN
+        -- Get current file size
+        SET @SQL = N'
+            SELECT @CurrentSizeMB_OUT = size / 128
+            FROM ' + QUOTENAME(@DatabaseName) + '.sys.database_files
+            WHERE name = @FileName_IN;';
+
+        EXEC sp_executesql @SQL,
+            N'@FileName_IN SYSNAME, @CurrentSizeMB_OUT INT OUTPUT',
+            @FileName_IN = @FileName,
+            @CurrentSizeMB_OUT = @CurrentSizeMB OUTPUT;
+
+        -- Calculate target size
+        SET @TargetSizeMB = @CurrentSizeMB - @ShrinkIncrementMB;
+        IF @TargetSizeMB <= 0
+        BEGIN
+            SET @Msg = 'Target size is too small. Stopping shrink.';
+            RAISERROR(@Msg, 0, 1) WITH NOWAIT;
+            BREAK;
+        END
+
+        -- Check blocking before shrink
+        SET @RetryCount = 0;
+        WHILE 1=1
+        BEGIN
+            SELECT TOP 1 @Blocking = r.blocking_session_id
+            FROM sys.dm_exec_requests r
+            JOIN sys.dm_exec_sessions s ON r.session_id = s.session_id
+            WHERE r.blocking_session_id <> 0
+              AND s.is_user_process = 1;
+
+            IF @Blocking IS NULL
+            BEGIN
+                BREAK; -- No blocking, proceed
+            END
+
+            SET @RetryCount += 1;
+            SET @Msg = 'Blocking detected (blocking_session_id=' + CAST(@Blocking AS VARCHAR) + '). Waiting 30 seconds before retrying. Retry #' + CAST(@RetryCount AS VARCHAR);
+            RAISERROR(@Msg, 0, 1) WITH NOWAIT;
+
+            WAITFOR DELAY '00:00:30';
+
+            IF @RetryCount >= @MaxRetries
+            BEGIN
+                RAISERROR('Max blocking retries reached. Skipping this shrink iteration.', 0, 1) WITH NOWAIT;
+                BREAK;
+            END
+        END
+
+        IF @RetryCount >= @MaxRetries
+        BEGIN
+            CONTINUE; -- skip this iteration, re-check timing
+        END
+
+        SET @Msg = 'Shrinking file [' + @FileName + '] from ' + CAST(@CurrentSizeMB AS VARCHAR) +
+                   ' MB to ' + CAST(@TargetSizeMB AS VARCHAR) + ' MB...';
+        RAISERROR(@Msg, 0, 1) WITH NOWAIT;
+
+        IF @DryRun = 1
+        BEGIN
+            RAISERROR('Dry run enabled: Skipping actual DBCC SHRINKFILE command.', 0, 1) WITH NOWAIT;
+        END
+        ELSE
+        BEGIN
+            -- Run shrink
+            SET @SQL = N'
+                USE ' + QUOTENAME(@DatabaseName) + ';
+                DBCC SHRINKFILE(' + QUOTENAME(@FileName) + ', ' + CAST(@TargetSizeMB AS VARCHAR) + ');
+            ';
+
+            EXEC sp_executesql @SQL;
+        END
+
+        SET @Msg = 'Completed shrink iteration. Current time: ' +
+                   CONVERT(VARCHAR, GETDATE(), 120) +
+                   '. Elapsed: ' + CAST(DATEDIFF(MINUTE, @StartTime, GETDATE()) AS VARCHAR) + ' min.';
+        RAISERROR(@Msg, 0, 1) WITH NOWAIT;
+
+        -- Safety break if no size change (only applies when not dry run)
+        IF @DryRun = 0 AND @CurrentSizeMB <= @TargetSizeMB
+        BEGIN
+            RAISERROR('No further shrink possible. Exiting.', 0, 1) WITH NOWAIT;
+            BREAK;
+        END
+    END
+
+    SET @Msg = '--- Shrink Operation Finished at ' + CONVERT(VARCHAR, GETDATE(), 120) + ' ---';
+    RAISERROR(@Msg, 0, 1) WITH NOWAIT;
+END
+GO
