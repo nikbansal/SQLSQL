@@ -1,0 +1,6 @@
+EXEC dbo.ShrinkDbFileSafely
+    @DatabaseName = 'YourDatabase',
+    @FileName = 'YourLogicalFileName',
+    @ShrinkIncrementMB = 5000,
+    @MaxMinutes = 60,
+    @DryRun = 0;  -- normal mode: will shrink
