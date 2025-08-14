@@ -29,11 +29,11 @@ BEGIN
 
     BEGIN TRY
         -- Capture starting sizes
-        SET @sql = N'
-            SELECT @curSize = size/128,
-                   @curUsed = FILEPROPERTY(name, ''SpaceUsed'')/128
-            FROM ' + QUOTENAME(@DatabaseName) + N'.sys.database_files
-            WHERE name = @file;';
+        SET @sql = N'SELECT @curSize = size/128,
+                            @curUsed = FILEPROPERTY(name, ''SpaceUsed'')/128
+                     FROM ' + QUOTENAME(@DatabaseName) + N'.sys.database_files
+                     WHERE name = @file;';
+
         EXEC sp_executesql @sql,
             N'@file SYSNAME, @curSize INT OUTPUT, @curUsed INT OUTPUT',
             @file=@FileName, @curSize=@curSizeMB OUTPUT, @curUsed=@curUsedMB OUTPUT;
@@ -109,14 +109,15 @@ BEGIN
                 RAISERROR('Step done.',0,1) WITH NOWAIT;
             END
 
-            -- If we simulated we still advance the loop time budget; refresh size to report
-            EXEC sp_executesql N'
-                SELECT @curSize = size/128,
-                       @curUsed = FILEPROPERTY(name, ''SpaceUsed'')/128
-                FROM ' + QUOTENAME(@DatabaseName) + '.sys.database_files
-                WHERE name = @file;',
-                N'@file SYSNAME, @curSize INT OUTPUT, @curUsed INT OUTPUT',
-                @file=@FileName, @curSize=@curSizeMB OUTPUT, @curUsed=@curUsedMB OUTPUT;
+            -- Refresh size to report
+            SET @sql = N'SELECT @curSize = size/128,
+                                @curUsed = FILEPROPERTY(name, ''SpaceUsed'')/128
+                         FROM ' + QUOTENAME(@DatabaseName) + N'.sys.database_files
+                         WHERE name = @file;';
+
+            EXEC sp_executesql @sql,
+                               N'@file SYSNAME, @curSize INT OUTPUT, @curUsed INT OUTPUT',
+                               @file=@FileName, @curSize=@curSizeMB OUTPUT, @curUsed=@curUsedMB OUTPUT;
 
             SET @msg = N'Current: Size=' + CAST(@curSizeMB AS varchar(20)) +
                        N' MB, Used=' + CAST(@curUsedMB AS varchar(20)) +
@@ -133,13 +134,13 @@ BEGIN
         END
 
         -- Final capture & log
-        EXEC sp_executesql N'
-            SELECT @curSize = size/128,
-                   @curUsed = FILEPROPERTY(name, ''SpaceUsed'')/128
-            FROM ' + QUOTENAME(@DatabaseName) + '.sys.database_files
-            WHERE name = @file;',
-            N'@file SYSNAME, @curSize INT OUTPUT, @curUsed INT OUTPUT',
-            @file=@FileName, @curSize=@curSizeMB OUTPUT, @curUsed=@curUsedMB OUTPUT;
+        SET @sql = N'SELECT @curSize = size/128,
+                            @curUsed = FILEPROPERTY(name, ''SpaceUsed'')/128
+                     FROM ' + QUOTENAME(@DatabaseName) + N'.sys.database_files
+                     WHERE name = @file;';
+        EXEC sp_executesql @sql,
+                           N'@file SYSNAME, @curSize INT OUTPUT, @curUsed INT OUTPUT',
+                           @file=@FileName, @curSize=@curSizeMB OUTPUT, @curUsed=@curUsedMB OUTPUT;
 
         UPDATE dbo.ShrinkLog
         SET EndTime = SYSUTCDATETIME(),
