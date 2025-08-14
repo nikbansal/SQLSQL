@@ -4,9 +4,9 @@ GO
 SELECT 
     name AS [LogicalFileName],
     physical_name AS [PhysicalFilePath],
-    ROUND(size/128.0, 0) AS [Size_MB],                 -- total file size, rounded
-    ROUND(FILEPROPERTY(name, 'SpaceUsed')/128.0, 0) AS [UsedSpace_MB],  -- used space, rounded
-    ROUND((size - FILEPROPERTY(name, 'SpaceUsed'))/128.0, 0) AS [FreeSpace_MB],  -- free space, rounded
-    ROUND((FILEPROPERTY(name, 'SpaceUsed')*100.0)/size, 0) AS [UsedPercent],       -- % used, rounded
+    CAST(size/128.0 AS INT) AS [Size_MB],                 -- total file size in MB
+    CAST(FILEPROPERTY(name, 'SpaceUsed')/128.0 AS INT) AS [UsedSpace_MB],  -- used space
+    CAST((size - FILEPROPERTY(name, 'SpaceUsed'))/128.0 AS INT) AS [FreeSpace_MB],  -- free space
+    CAST((FILEPROPERTY(name, 'SpaceUsed')*100.0)/size AS INT) AS [UsedPercent],       -- % used
     type_desc AS [FileType]
 FROM sys.database_files;
