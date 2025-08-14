@@ -14,25 +14,38 @@ AS
 BEGIN
     SET NOCOUNT ON;
 
-    DECLARE @curSizeMB INT,
-            @curUsedMB INT,
-            @targetSizeMB INT,
-            @sql NVARCHAR(MAX),
-            @msg NVARCHAR(4000),
-            @dbNameQuoted SYSNAME;
+    DECLARE 
+        @curSizeMB INT,
+        @curUsedMB INT,
+        @targetSizeMB INT,
+        @sql NVARCHAR(MAX),
+        @msg NVARCHAR(4000),
+        @dbNameQuoted SYSNAME;
 
     -- Quote database name safely
     SET @dbNameQuoted = QUOTENAME(@DatabaseName);
 
     -- Get initial size and used space
-    SET @sql = N'SELECT @curSize = size/128,
-                        @curUsed = FILEPROPERTY(name, ''SpaceUsed'')/128
-                 FROM ' + @dbNameQuoted + N'.sys.database_files
+    SET @sql = N'SELECT @curSizeInner = size/128,
+                        @curUsedInner = FILEPROPERTY(name, ''SpaceUsed'')/128
+                 FROM sys.database_files
                  WHERE name = @file;';
 
-    EXEC sp_executesql @sql,
-                       N'@file SYSNAME, @curSize INT OUTPUT, @curUsed INT OUTPUT',
-                       @file=@FileName, @curSize=@curSizeMB OUTPUT, @curUsed=@curUsedMB OUTPUT;
+    -- Switch to target database
+    SET @sql = N'USE ' + @dbNameQuoted + N'; ' + @sql;
+
+    -- Execute with inner output variables
+    DECLARE @curSizeInner INT, @curUsedInner INT;
+
+    EXEC sp_executesql 
+        @sql,
+        N'@file SYSNAME, @curSizeInner INT OUTPUT, @curUsedInner INT OUTPUT',
+        @file = @FileName,
+        @curSizeInner = @curSizeInner OUTPUT,
+        @curUsedInner = @curUsedInner OUTPUT;
+
+    SET @curSizeMB = @curSizeInner;
+    SET @curUsedMB = @curUsedInner;
 
     RAISERROR('Initial: Size=%d MB, Used=%d MB',0,1,@curSizeMB,@curUsedMB) WITH NOWAIT;
 
@@ -47,19 +60,29 @@ BEGIN
         END
         ELSE
         BEGIN
+            -- Build DBCC SHRINKFILE command
             SET @sql = N'USE ' + @dbNameQuoted + N';
-                         DBCC SHRINKFILE(' + QUOTENAME(@FileName) + N', ' + CAST(@targetSizeMB AS varchar(20)) + N') WITH NO_INFOMSGS;';
-            RAISERROR('Executing: %s',0,1,@sql) WITH NOWAIT;
+                        DBCC SHRINKFILE(' + QUOTENAME(@FileName) + N', ' + CAST(@targetSizeMB AS NVARCHAR(20)) + N') WITH NO_INFOMSGS;';
+            RAISERROR(N'Executing: %s',0,1,@sql) WITH NOWAIT;
             EXEC sp_executesql @sql;
         END
 
-        -- Refresh current size after each small step
-        EXEC sp_executesql N'SELECT @curSize = size/128,
-                                   @curUsed = FILEPROPERTY(name, ''SpaceUsed'')/128
-                            FROM ' + @dbNameQuoted + N'.sys.database_files
-                            WHERE name = @file;',
-                           N'@file SYSNAME, @curSize INT OUTPUT, @curUsed INT OUTPUT',
-                           @file=@FileName, @curSize=@curSizeMB OUTPUT, @curUsed=@curUsedMB OUTPUT;
+        -- Refresh current size after each step
+        SET @sql = N'SELECT @curSizeInner = size/128,
+                           @curUsedInner = FILEPROPERTY(name, ''SpaceUsed'')/128
+                    FROM sys.database_files
+                    WHERE name = @file;';
+        SET @sql = N'USE ' + @dbNameQuoted + N'; ' + @sql;
+
+        EXEC sp_executesql 
+            @sql,
+            N'@file SYSNAME, @curSizeInner INT OUTPUT, @curUsedInner INT OUTPUT',
+            @file = @FileName,
+            @curSizeInner = @curSizeInner OUTPUT,
+            @curUsedInner = @curUsedInner OUTPUT;
+
+        SET @curSizeMB = @curSizeInner;
+        SET @curUsedMB = @curUsedInner;
 
         RAISERROR('Current: Size=%d MB, Used=%d MB',0,1,@curSizeMB,@curUsedMB) WITH NOWAIT;
 
