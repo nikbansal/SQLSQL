@@ -1,0 +1,73 @@
+USE master;
+GO
+
+IF OBJECT_ID('dbo.ShrinkDbFileSimple', 'P') IS NOT NULL
+    DROP PROCEDURE dbo.ShrinkDbFileSimple;
+GO
+
+CREATE PROCEDURE dbo.ShrinkDbFileSimple
+    @DatabaseName      SYSNAME,
+    @FileName          SYSNAME,
+    @ShrinkIncrementMB INT = 256,    -- each step in MB
+    @DryRun            BIT = 0       -- 1 = simulate only
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    DECLARE @curSizeMB INT,
+            @curUsedMB INT,
+            @targetSizeMB INT,
+            @sql NVARCHAR(MAX),
+            @msg NVARCHAR(4000);
+
+    -- Get initial size and used space
+    SET @sql = N'SELECT @curSize = size/128,
+                        @curUsed = FILEPROPERTY(name, ''SpaceUsed'')/128
+                 FROM ' + QUOTENAME(@DatabaseName) + N'.sys.database_files
+                 WHERE name = @file;';
+
+    EXEC sp_executesql @sql,
+                       N'@file SYSNAME, @curSize INT OUTPUT, @curUsed INT OUTPUT',
+                       @file=@FileName, @curSize=@curSizeMB OUTPUT, @curUsed=@curUsedMB OUTPUT;
+
+    SET @msg = N'Initial: Size=' + CAST(@curSizeMB AS varchar(20)) + N' MB, Used=' + CAST(@curUsedMB AS varchar(20)) + N' MB';
+    RAISERROR(@msg,0,1) WITH NOWAIT;
+
+    WHILE @curSizeMB > @curUsedMB + @ShrinkIncrementMB
+    BEGIN
+        SET @targetSizeMB = @curSizeMB - @ShrinkIncrementMB;
+
+        IF @DryRun = 1
+        BEGIN
+            SET @msg = N'Dry run: would shrink ' + @FileName + N' from ' + CAST(@curSizeMB AS varchar(20)) +
+                       N' MB to ' + CAST(@targetSizeMB AS varchar(20)) + N' MB';
+            RAISERROR(@msg,0,1) WITH NOWAIT;
+        END
+        ELSE
+        BEGIN
+            SET @sql = N'USE ' + QUOTENAME(@DatabaseName) + N';
+                         DBCC SHRINKFILE(' + QUOTENAME(@FileName) + N', ' + CAST(@targetSizeMB AS varchar(20)) + N') WITH NO_INFOMSGS;';
+            SET @msg = N'Executing: ' + @sql;
+            RAISERROR(@msg,0,1) WITH NOWAIT;
+            EXEC sp_executesql @sql;
+        END
+
+        -- Refresh current size
+        EXEC sp_executesql N'SELECT @curSize = size/128,
+                                   @curUsed = FILEPROPERTY(name, ''SpaceUsed'')/128
+                            FROM ' + QUOTENAME(@DatabaseName) + N'.sys.database_files
+                            WHERE name = @file;',
+                           N'@file SYSNAME, @curSize INT OUTPUT, @curUsed INT OUTPUT',
+                           @file=@FileName, @curSize=@curSizeMB OUTPUT, @curUsed=@curUsedMB OUTPUT;
+
+        SET @msg = N'Current: Size=' + CAST(@curSizeMB AS varchar(20)) + N' MB, Used=' + CAST(@curUsedMB AS varchar(20)) + N' MB';
+        RAISERROR(@msg,0,1) WITH NOWAIT;
+
+        -- Stop if no more shrink is possible
+        IF @curSizeMB <= @curUsedMB + @ShrinkIncrementMB
+            BREAK;
+    END
+
+    RAISERROR('Shrink complete for file %s in database %s',0,1,@FileName,@DatabaseName) WITH NOWAIT;
+END
+GO
