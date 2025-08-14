@@ -1,0 +1,31 @@
+USE master;
+GO
+
+IF OBJECT_ID('dbo.ShrinkLog','U') IS NULL
+BEGIN
+    CREATE TABLE dbo.ShrinkLog
+    (
+        LogID            BIGINT IDENTITY(1,1) PRIMARY KEY,
+        RunGuid          UNIQUEIDENTIFIER NOT NULL,
+        DatabaseName     SYSNAME NOT NULL,
+        FileName         SYSNAME NOT NULL,
+        StartTime        DATETIME2(0) NOT NULL DEFAULT SYSUTCDATETIME(),
+        EndTime          DATETIME2(0) NULL,
+        StartSizeMB      INT     NULL,
+        StartUsedMB      INT     NULL,
+        EndSizeMB        INT     NULL,
+        EndUsedMB        INT     NULL,
+        TotalReclaimedMB AS (CASE WHEN StartSizeMB IS NOT NULL AND EndSizeMB IS NOT NULL
+                                  THEN StartSizeMB - EndSizeMB END),
+        Status           VARCHAR(50) NULL,     -- Started / Completed / TimedOut / Aborted / Error
+        Message          VARCHAR(4000) NULL
+    );
+END
+GO
+
+
+
+----Select
+SELECT TOP (20) *
+FROM dbo.ShrinkLog
+ORDER BY LogID DESC;

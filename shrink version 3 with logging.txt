@@ -1,0 +1,156 @@
+USE master;
+GO
+
+IF OBJECT_ID('dbo.ShrinkDbFileSafely', 'P') IS NOT NULL
+    DROP PROCEDURE dbo.ShrinkDbFileSafely;
+GO
+
+CREATE PROCEDURE dbo.ShrinkDbFileSafely
+    @DatabaseName        SYSNAME,
+    @FileName            SYSNAME,
+    @ShrinkIncrementMB   INT = 256,    -- keep small so each DBCC is quick
+    @MaxMinutes          INT = 180,    -- overall budget for this run
+    @DryRun              BIT = 0       -- 1 = simulate, 0 = execute
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    DECLARE
+        @RunGuid UNIQUEIDENTIFIER = NEWID(),
+        @startTime DATETIME2(0) = SYSUTCDATETIME(),
+        @sql NVARCHAR(MAX),
+        @curSizeMB INT,
+        @curUsedMB INT,
+        @targetSizeMB INT,
+        @msg NVARCHAR(4000),
+        @blocking INT,
+        @retry INT,
+        @maxRetries INT = 10;
+
+    BEGIN TRY
+        -- Capture starting sizes
+        SET @sql = N'
+            SELECT @curSize = size/128,
+                   @curUsed = FILEPROPERTY(name, ''SpaceUsed'')/128
+            FROM ' + QUOTENAME(@DatabaseName) + N'.sys.database_files
+            WHERE name = @file;';
+        EXEC sp_executesql @sql,
+            N'@file SYSNAME, @curSize INT OUTPUT, @curUsed INT OUTPUT',
+            @file=@FileName, @curSize=@curSizeMB OUTPUT, @curUsed=@curUsedMB OUTPUT;
+
+        INSERT dbo.ShrinkLog(RunGuid,DatabaseName,FileName,StartTime,StartSizeMB,StartUsedMB,Status,Message)
+        VALUES(@RunGuid,@DatabaseName,@FileName,@startTime,@curSizeMB,@curUsedMB,'Started','Shrink run started');
+
+        RAISERROR('Run %s: Start %s/%s — Size=%d MB, Used=%d MB',0,1,CONVERT(varchar(36),@RunGuid),@DatabaseName,@FileName,@curSizeMB,@curUsedMB) WITH NOWAIT;
+
+        WHILE DATEDIFF(MINUTE, @startTime, SYSUTCDATETIME()) < @MaxMinutes
+        BEGIN
+            -- Refresh current size
+            EXEC sp_executesql @sql,
+                N'@file SYSNAME, @curSize INT OUTPUT, @curUsed INT OUTPUT',
+                @file=@FileName, @curSize=@curSizeMB OUTPUT, @curUsed=@curUsedMB OUTPUT;
+
+            -- Compute next target
+            SET @targetSizeMB = @curSizeMB - @ShrinkIncrementMB;
+            IF @targetSizeMB <= 0
+            BEGIN
+                RAISERROR('Target would be <= 0; stopping.',0,1) WITH NOWAIT;
+                BREAK;
+            END
+
+            RAISERROR('Next step: %s/%s from %d MB to %d MB',0,1,@DatabaseName,@FileName,@curSizeMB,@targetSizeMB) WITH NOWAIT;
+
+            IF @DryRun = 1
+            BEGIN
+                RAISERROR('Dry run: would execute DBCC SHRINKFILE(%s, %d)',0,1,@FileName,@targetSizeMB) WITH NOWAIT;
+            END
+            ELSE
+            BEGIN
+                -- Blocking check
+                SET @retry = 0;
+                WHILE 1=1
+                BEGIN
+                    SELECT TOP 1 @blocking = r.blocking_session_id
+                    FROM sys.dm_exec_requests r
+                    JOIN sys.dm_exec_sessions s ON r.session_id = s.session_id
+                    WHERE r.blocking_session_id <> 0
+                      AND s.is_user_process = 1;
+                    IF @blocking IS NULL BREAK;
+
+                    SET @retry += 1;
+                    RAISERROR('Blocking detected (spid=%d). Waiting 30s (retry %d/%d)...',0,1,@blocking,@retry,@maxRetries) WITH NOWAIT;
+                    WAITFOR DELAY '00:00:30';
+                    IF @retry >= @maxRetries
+                    BEGIN
+                        RAISERROR('Max blocking retries reached; skipping this iteration.',0,1) WITH NOWAIT;
+                        BREAK;
+                    END
+                END
+                IF @retry >= @maxRetries CONTINUE;
+
+                -- Execute quick DBCC step
+                SET @sql = N'USE ' + QUOTENAME(@DatabaseName) + N';
+                              DBCC SHRINKFILE(' + QUOTENAME(@FileName) + N', ' + CAST(@targetSizeMB AS varchar(20)) + N') WITH NO_INFOMSGS;';
+                RAISERROR('Executing: %s',0,1,@sql) WITH NOWAIT;
+                EXEC sp_executesql @sql;
+                RAISERROR('Step done.',0,1) WITH NOWAIT;
+            END
+
+            -- If we simulated we still advance the loop time budget; refresh size to report
+            EXEC sp_executesql N'
+                SELECT @curSize = size/128,
+                       @curUsed = FILEPROPERTY(name, ''SpaceUsed'')/128
+                FROM ' + QUOTENAME(@DatabaseName) + '.sys.database_files
+                WHERE name = @file;',
+                N'@file SYSNAME, @curSize INT OUTPUT, @curUsed INT OUTPUT',
+                @file=@FileName, @curSize=@curSizeMB OUTPUT, @curUsed=@curUsedMB OUTPUT;
+
+            RAISERROR('Current: Size=%d MB, Used=%d MB; Elapsed=%d min of %d',0,1,@curSizeMB,@curUsedMB,DATEDIFF(MINUTE,@startTime,SYSUTCDATETIME()),@MaxMinutes) WITH NOWAIT;
+
+            -- Safety: if size didn’t change (in non-dry run), break
+            IF @DryRun = 0 AND @curSizeMB <= @targetSizeMB
+            BEGIN
+                RAISERROR('No further shrink possible this run; stopping.',0,1) WITH NOWAIT;
+                BREAK;
+            END
+        END
+
+        -- Final capture & log
+        EXEC sp_executesql N'
+            SELECT @curSize = size/128,
+                   @curUsed = FILEPROPERTY(name, ''SpaceUsed'')/128
+            FROM ' + QUOTENAME(@DatabaseName) + '.sys.database_files
+            WHERE name = @file;',
+            N'@file SYSNAME, @curSize INT OUTPUT, @curUsed INT OUTPUT',
+            @file=@FileName, @curSize=@curSizeMB OUTPUT, @curUsed=@curUsedMB OUTPUT;
+
+        UPDATE dbo.ShrinkLog
+        SET EndTime = SYSUTCDATETIME(),
+            EndSizeMB = @curSizeMB,
+            EndUsedMB = @curUsedMB,
+            Status = CASE WHEN DATEDIFF(MINUTE,@startTime,SYSUTCDATETIME()) >= @MaxMinutes
+                          THEN 'TimedOut' ELSE 'Completed' END,
+            Message = 'Finished run'
+        WHERE RunGuid = @RunGuid;
+
+        RAISERROR('Run complete. StartSize=%dMB EndSize=%dMB Reclaimed=%dMB Status=%s',
+                  0,1,
+                  (SELECT StartSizeMB FROM dbo.ShrinkLog WHERE RunGuid=@RunGuid),
+                  @curSizeMB,
+                  (SELECT StartSizeMB-@curSizeMB FROM dbo.ShrinkLog WHERE RunGuid=@RunGuid),
+                  (SELECT Status FROM dbo.ShrinkLog WHERE RunGuid=@RunGuid)) WITH NOWAIT;
+    END TRY
+    BEGIN CATCH
+        DECLARE @err NVARCHAR(4000) = ERROR_MESSAGE();
+        UPDATE dbo.ShrinkLog
+        SET EndTime = SYSUTCDATETIME(),
+            EndSizeMB = @curSizeMB,
+            EndUsedMB = @curUsedMB,
+            Status = 'Error',
+            Message = @err
+        WHERE RunGuid = @RunGuid;
+
+        RAISERROR('ERROR: %s',16,1,@err) WITH NOWAIT;
+    END CATCH
+END
+GO
