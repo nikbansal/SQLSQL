@@ -1,0 +1,71 @@
+CREATE OR ALTER PROCEDURE dbo.ShrinkFileControlled
+    @DBName SYSNAME,                -- Database to shrink
+    @DBFileName SYSNAME,            -- Logical file name
+    @ShrinkIncrementMB INT = 150,   -- Increment per shrink loop
+    @MaxMinutes INT = 180,          -- Max runtime in minutes
+    @TargetFreeMB INT = 384,        -- Desired free space to leave
+    @DryRun BIT = 1                 -- 1 = show commands only, 0 = execute
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    DECLARE @StartTime DATETIME = GETDATE();
+    DECLARE @SizeMB INT, @UsedMB INT, @sql NVARCHAR(2000);
+    DECLARE @Msg NVARCHAR(500);
+
+    -- Build dynamic SQL to run inside target DB
+    DECLARE @ExecSql NVARCHAR(MAX) = N'USE ' + QUOTENAME(@DBName) + N';
+        SELECT @SizeMB = size / 128
+        FROM sys.database_files
+        WHERE name = @DBFileName;
+
+        SELECT @UsedMB = FILEPROPERTY(@DBFileName, ''SpaceUsed'') / 128;
+    ';
+
+    -- Get initial size & usage
+    EXEC sp_executesql 
+        @ExecSql,
+        N'@DBFileName SYSNAME, @SizeMB INT OUTPUT, @UsedMB INT OUTPUT',
+        @DBFileName = @DBFileName,
+        @SizeMB = @SizeMB OUTPUT,
+        @UsedMB = @UsedMB OUTPUT;
+
+    RAISERROR('Starting shrink for DB %s, File %s', 0, 1, @DBName, @DBFileName) WITH NOWAIT;
+    RAISERROR('Initial Size: %d MB, Used: %d MB', 0, 1, @SizeMB, @UsedMB) WITH NOWAIT;
+
+    WHILE @SizeMB > @UsedMB + @TargetFreeMB + @ShrinkIncrementMB
+    BEGIN
+        IF DATEDIFF(MINUTE, @StartTime, GETDATE()) >= @MaxMinutes
+        BEGIN
+            RAISERROR('Reached max time limit of %d minutes. Stopping.', 0, 1, @MaxMinutes) WITH NOWAIT;
+            BREAK;
+        END
+
+        SET @sql = N'DBCC SHRINKFILE (' + QUOTENAME(@DBFileName) + N', ' + 
+                   CONVERT(NVARCHAR(20), @SizeMB - @ShrinkIncrementMB) + N')';
+
+        IF @DryRun = 1
+        BEGIN
+            RAISERROR('(DryRun) Would execute: %s', 0, 1, @sql) WITH NOWAIT;
+        END
+        ELSE
+        BEGIN
+            RAISERROR('Executing: %s', 0, 1, @sql) WITH NOWAIT;
+            EXEC (N'USE ' + QUOTENAME(@DBName) + N'; ' + @sql);
+        END
+
+        -- Recalculate sizes
+        EXEC sp_executesql 
+            @ExecSql,
+            N'@DBFileName SYSNAME, @SizeMB INT OUTPUT, @UsedMB INT OUTPUT',
+            @DBFileName = @DBFileName,
+            @SizeMB = @SizeMB OUTPUT,
+            @UsedMB = @UsedMB OUTPUT;
+
+        RAISERROR('Current Size: %d MB, Used: %d MB', 0, 1, @SizeMB, @UsedMB) WITH NOWAIT;
+    END
+
+    RAISERROR('Final Size: %d MB, Used: %d MB', 0, 1, @SizeMB, @UsedMB) WITH NOWAIT;
+    RAISERROR('Shrink operation completed.', 0, 1) WITH NOWAIT;
+END
+GO
